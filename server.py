@@ -1,30 +1,63 @@
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from TTS.api import TTS
-import tempfile
 import os
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
+from pydantic import BaseModel
+import torchaudio as ta
 
-app = FastAPI(title="MDA Coqui TTS")
+from chatterbox.mtl_tts import ChatterboxMultilingualTTS  # multilingual
 
-# Good Arabic option (multilingual):
-# Runs on CPU fine, but first load is heavy.
-tts = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
+app = FastAPI()
 
-class TtsReq(BaseModel):
+MODEL = None
+SR = 24000  # Chatterbox uses 24k in examples; we'll export wav at model.sr
+
+# Simple local voice registry (you can later move this to DB)
+VOICE_MAP = {
+    # "basma": "voices/basma.wav",
+    # "narrator": "voices/narrator_male_01.wav",
+}
+
+class TtsRequest(BaseModel):
     text: str
+    language_id: str = "ar"     # "ar" for Arabic, "en" for English, etc.
+    voice_id: str | None = None # optional - picks a reference clip if present
+
+@app.on_event("startup")
+def load_model():
+    global MODEL
+    device = "cpu"  # Render is CPU unless you pay for GPU
+    MODEL = ChatterboxMultilingualTTS.from_pretrained(device=device)
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
 @app.post("/tts")
-def synth(req: TtsReq):
-    fd, path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
+def tts(req: TtsRequest):
+    if MODEL is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet")
 
-    # Synthesize to file
-    tts.tts_to_file(text=req.text, file_path=path)
+    if not req.text or not req.text.strip():
+        raise HTTPException(status_code=400, detail="text is required")
 
-    # Return wav as a downloadable stream
-    return FileResponse(path, media_type="audio/wav", filename="speech.wav")
+    audio_prompt_path = None
+    if req.voice_id:
+        audio_prompt_path = VOICE_MAP.get(req.voice_id)
+        if not audio_prompt_path or not os.path.exists(audio_prompt_path):
+            raise HTTPException(status_code=404, detail=f"Unknown voice_id: {req.voice_id}")
+
+    # Generate
+    wav = MODEL.generate(
+        req.text,
+        language_id=req.language_id,
+        audio_prompt_path=audio_prompt_path
+    )
+
+    # Encode to WAV bytes
+    out_path = "/tmp/out.wav"
+    ta.save(out_path, wav, MODEL.sr)
+
+    with open(out_path, "rb") as f:
+        wav_bytes = f.read()
+
+    return Response(content=wav_bytes, media_type="audio/wav")

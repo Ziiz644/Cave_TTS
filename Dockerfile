@@ -1,28 +1,19 @@
 FROM python:3.11-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
-# -------------------------
-# 1️⃣ System + build deps
-# -------------------------
-RUN apt-get update && apt-get install -y \
+# audio dependencies (libsndfile for soundfile; ffmpeg optional but useful)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    git \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
+    libsndfile1 \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
-# -------------------------
-# 2️⃣ Python deps
-# -------------------------
 COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-RUN pip install --upgrade pip && pip install -r requirements.txt
+COPY . /app
 
-COPY server.py /app/server.py
-
-EXPOSE 8008
-
-CMD ["uvicorn", "server:app","--host","0.0.0.0","--port","8008"]
+EXPOSE 8000
+CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}"]
