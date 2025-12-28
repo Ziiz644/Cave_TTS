@@ -1,19 +1,28 @@
-ARG BASE=nvidia/cuda:11.8.0-base-ubuntu22.04
-FROM ${BASE}
+FROM python:3.11-slim
 
-RUN apt-get update && apt-get upgrade -y
-RUN apt-get install -y --no-install-recommends gcc g++ make python3 python3-dev python3-pip python3-venv python3-wheel espeak-ng libsndfile1-dev && rm -rf /var/lib/apt/lists/*
-RUN pip3 install llvmlite --ignore-installed
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# Install Dependencies:
-RUN pip3 install torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu118
-RUN rm -rf /root/.cache/pip
+# -------------------------
+# 1️⃣ System + build deps
+# -------------------------
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    git \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy TTS repository contents:
-WORKDIR /root
-COPY . /root
+WORKDIR /app
 
-RUN make install
+# -------------------------
+# 2️⃣ Python deps
+# -------------------------
+COPY requirements.txt /app/requirements.txt
 
-ENTRYPOINT ["tts"]
-CMD ["--help"]
+RUN pip install --upgrade pip && pip install -r requirements.txt
+
+COPY server.py /app/server.py
+
+EXPOSE 8008
+
+CMD ["uvicorn", "server:app","--host","0.0.0.0","--port","8008","]
