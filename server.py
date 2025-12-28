@@ -12,10 +12,12 @@ MODEL = None
 SR = 24000  # Chatterbox uses 24k in examples; we'll export wav at model.sr
 
 # Simple local voice registry (you can later move this to DB)
+
 VOICE_MAP = {
-    # "basma": "voices/basma.wav",
-    # "narrator": "voices/narrator_male_01.wav",
+    "basma": "voices/basma.wav",
+    "layla": "voices/sirin.wav",
 }
+
 
 class TtsRequest(BaseModel):
     text: str
@@ -42,7 +44,7 @@ def tts(req: TtsRequest):
 
     audio_prompt_path = None
     if req.voice_id:
-        audio_prompt_path = VOICE_MAP.get(req.voice_id)
+        audio_prompt_path = ensure_wav(VOICE_MAP.get(req.voice_id))
         if not audio_prompt_path or not os.path.exists(audio_prompt_path):
             raise HTTPException(status_code=404, detail=f"Unknown voice_id: {req.voice_id}")
 
@@ -61,3 +63,40 @@ def tts(req: TtsRequest):
         wav_bytes = f.read()
 
     return Response(content=wav_bytes, media_type="audio/wav")
+
+@app.get("/voices")
+def list_voices():
+    return {
+        "voices": list(VOICE_MAP.keys())
+    }
+
+import subprocess
+from pathlib import Path
+
+def ensure_wav(path: str) -> str:
+    p = Path(path)
+
+    if not p.exists():
+        raise FileNotFoundError(f"Voice file not found: {p}")
+
+    if p.suffix.lower() == ".wav":
+        return str(p)
+
+    out = p.with_suffix(".wav")
+
+    if out.exists():
+        return str(out)
+
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", str(p),
+            "-ac", "1",
+            "-ar", "24000",
+            "-sample_fmt", "s16",
+            str(out),
+        ],
+        check=True
+    )
+
+    return str(out)
