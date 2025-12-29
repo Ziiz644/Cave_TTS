@@ -29,14 +29,14 @@ def health():
 
 @app.get("/api/tts/voices")
 def list_voices():
-    # List all *.onnx in VOICES_DIR (excluding nested configs)
     voices = []
     for onnx in VOICES_DIR.rglob("*.onnx"):
-        rel = onnx.relative_to(VOICES_DIR).as_posix()
-        # voice_id is path without ".onnx"
-        voices.append(rel[:-5])
+        cfg = Path(str(onnx) + ".json")
+        if cfg.exists():
+            voices.append(onnx.relative_to(VOICES_DIR).as_posix()[:-5])  # remove ".onnx"
     voices.sort()
     return {"voices": voices}
+
 
 @app.post("/api/tts/speak")
 def speak(req: SpeakRequest):
