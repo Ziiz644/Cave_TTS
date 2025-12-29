@@ -1,102 +1,88 @@
-import os
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
-from pydantic import BaseModel
-import torchaudio as ta
-
-from chatterbox.mtl_tts import ChatterboxMultilingualTTS  # multilingual
+from fastapi import FastAPI
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
+import subprocess, uuid, os
+from pathlib import Path
 
 app = FastAPI()
 
-MODEL = None
-SR = 24000  # Chatterbox uses 24k in examples; we'll export wav at model.sr
+OUT_DIR = Path("/tmp/tts")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Simple local voice registry (you can later move this to DB)
+# We'll install Piper CLI inside the image, so "piper" exists
+PIPER_BIN = "piper"
 
-VOICE_MAP = {
-    "basma": "voices/basma.wav",
-    "layla": "voices/sirin.wav",
-}
+# Where voice files live inside the container
+VOICES_DIR = Path(os.getenv("VOICES_DIR", "/app/voices"))
 
-
-class TtsRequest(BaseModel):
-    text: str
-    language_id: str = "ar"     # "ar" for Arabic, "en" for English, etc.
-    voice_id: str | None = None # optional - picks a reference clip if present
-
-@app.on_event("startup")
-def load_model():
-    global MODEL
-    device = "cpu"  # Render is CPU unless you pay for GPU
-    MODEL = ChatterboxMultilingualTTS.from_pretrained(device=device)
+class SpeakRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+    voice_id: str = Field(..., description="Relative path under /app/voices without extension, e.g. 'en/en_US-amy-low'")
+    speaker_id: int | None = Field(default=None, description="For multi-speaker models only")
+    length_scale: float | None = Field(default=None, description="Speaking speed/cadence (model-dependent)")
+    noise_scale: float | None = Field(default=None, description="Variation (model-dependent)")
+    noise_w: float | None = Field(default=None, description="Variation (model-dependent)")
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
-@app.post("/tts")
-def tts(req: TtsRequest):
-    if MODEL is None:
-        raise HTTPException(status_code=503, detail="Model not loaded yet")
-
-    if not req.text or not req.text.strip():
-        raise HTTPException(status_code=400, detail="text is required")
-
-    audio_prompt_path = None
-    if req.voice_id:
-        audio_prompt_path = ensure_wav(VOICE_MAP.get(req.voice_id))
-        if not audio_prompt_path or not os.path.exists(audio_prompt_path):
-            raise HTTPException(status_code=404, detail=f"Unknown voice_id: {req.voice_id}")
-
-    # Generate
-    wav = MODEL.generate(
-        req.text,
-        language_id=req.language_id,
-        audio_prompt_path=audio_prompt_path
-    )
-
-    # Encode to WAV bytes
-    out_path = "/tmp/out.wav"
-    ta.save(out_path, wav, MODEL.sr)
-
-    with open(out_path, "rb") as f:
-        wav_bytes = f.read()
-
-    return Response(content=wav_bytes, media_type="audio/wav")
-
-@app.get("/voices")
+@app.get("/api/tts/voices")
 def list_voices():
-    return {
-        "voices": list(VOICE_MAP.keys())
-    }
+    # List all *.onnx in VOICES_DIR (excluding nested configs)
+    voices = []
+    for onnx in VOICES_DIR.rglob("*.onnx"):
+        rel = onnx.relative_to(VOICES_DIR).as_posix()
+        # voice_id is path without ".onnx"
+        voices.append(rel[:-5])
+    voices.sort()
+    return {"voices": voices}
 
-import subprocess
-from pathlib import Path
+@app.post("/api/tts/speak")
+def speak(req: SpeakRequest):
+    text = req.text.strip()
+    if not text:
+        return JSONResponse({"error": "text is required"}, status_code=400)
 
-def ensure_wav(path: str) -> str:
-    p = Path(path)
+    model_path = VOICES_DIR / f"{req.voice_id}.onnx"
+    config_path = VOICES_DIR / f"{req.voice_id}.onnx.json"
 
-    if not p.exists():
-        raise FileNotFoundError(f"Voice file not found: {p}")
+    if not model_path.exists() or not config_path.exists():
+        return JSONResponse(
+            {"error": "unknown_voice", "details": f"Missing {model_path} or {config_path}"},
+            status_code=404,
+        )
 
-    if p.suffix.lower() == ".wav":
-        return str(p)
+    out_wav = OUT_DIR / f"{uuid.uuid4().hex}.wav"
 
-    out = p.with_suffix(".wav")
+    cmd = [
+        PIPER_BIN,
+        "-m", str(model_path),
+        "-c", str(config_path),
+        "-f", str(out_wav),
+    ]
 
-    if out.exists():
-        return str(out)
+    # Optional parameters (supported by Piper builds; safe to pass only when provided)
+    if req.speaker_id is not None:
+        cmd += ["-s", str(req.speaker_id)]  # speaker_id supported in Piper CLI :contentReference[oaicite:3]{index=3}
+    if req.length_scale is not None:
+        cmd += ["--length_scale", str(req.length_scale)]
+    if req.noise_scale is not None:
+        cmd += ["--noise_scale", str(req.noise_scale)]
+    if req.noise_w is not None:
+        cmd += ["--noise_w", str(req.noise_w)]
 
-    subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", str(p),
-            "-ac", "1",
-            "-ar", "24000",
-            "-sample_fmt", "s16",
-            str(out),
-        ],
-        check=True
+    proc = subprocess.run(
+        cmd,
+        input=text.encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
 
-    return str(out)
+    if proc.returncode != 0:
+        return JSONResponse(
+            {"error": "tts_failed", "details": proc.stderr.decode("utf-8", "ignore")},
+            status_code=500,
+        )
+
+    return FileResponse(str(out_wav), media_type="audio/wav", filename="speech.wav")
