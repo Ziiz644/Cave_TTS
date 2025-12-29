@@ -1,6 +1,10 @@
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
-pydantic==2.10.3
 
-# Piper CLI + runtime
-piper
+# Chatterbox
+chatterbox-tts
+
+# CPU torch (let pip resolve; on Render this can be heavy but works)
+torch
+torchaudio
+soundfile
