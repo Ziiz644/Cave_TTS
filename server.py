@@ -38,6 +38,7 @@ def list_voices():
     return {"voices": voices}
 
 
+
 @app.post("/api/tts/speak")
 def speak(req: SpeakRequest):
     text = req.text.strip()
