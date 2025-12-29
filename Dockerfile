@@ -10,13 +10,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 # ---- install Piper CLI (binary) ----
-# Choose a stable Piper release build for Linux x86_64
-# (This puts `piper` on PATH)
 RUN mkdir -p /opt/piper && \
-    curl -L -o /tmp/piper.zip https://github.com/rhasspy/piper/releases/latest/download/piper_linux_x86_64.zip && \
-    unzip /tmp/piper.zip -d /opt/piper && \
-    ln -s /opt/piper/piper /usr/local/bin/piper && \
-    rm -f /tmp/piper.zip
+    curl -fL -o /tmp/piper.tar.gz https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz && \
+    tar -xzf /tmp/piper.tar.gz -C /opt/piper --strip-components=1 && \
+    ln -sf /opt/piper/piper /usr/local/bin/piper && \
+    rm -f /tmp/piper.tar.gz && \
+    piper --help | head -n 2
+
 
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
