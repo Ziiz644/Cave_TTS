@@ -4,28 +4,27 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV VOICES_DIR=/app/voices
 
-# Minimal system deps:
-# - espeak-ng commonly needed by local TTS stacks (phonemization)
-# - ca-certificates/curl for downloading voices during build
-# - libsndfile1 is harmless and useful if you add audio tooling later
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl unzip \
     espeak-ng \
-    ca-certificates \
-    curl \
-    libsndfile1 \
  && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+# ---- install Piper CLI (binary) ----
+# Choose a stable Piper release build for Linux x86_64
+# (This puts `piper` on PATH)
+RUN mkdir -p /opt/piper && \
+    curl -L -o /tmp/piper.zip https://github.com/rhasspy/piper/releases/latest/download/piper_linux_x86_64.zip && \
+    unzip /tmp/piper.zip -d /opt/piper && \
+    ln -s /opt/piper/piper /usr/local/bin/piper && \
+    rm -f /tmp/piper.zip
 
-# Install deps first for Docker layer caching
+WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy app
 COPY . /app
 
-# (Optional but recommended) download voices during build
-# If you use this, keep your selected voices list small for Render build speed.
+# If you have download_voices.py enabled:
 RUN python /app/scripts/download_voices.py
 
 EXPOSE 8000
