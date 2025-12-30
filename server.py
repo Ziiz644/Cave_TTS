@@ -10,6 +10,26 @@ from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
 app = FastAPI()
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:8100",
+        "http://127.0.0.1:8100",
+        "https://mda-ai-backend:8080",
+        "https://api.mda.sa",
+        "https://mda.sa",
+        "https://www.mda.sa",
+        # add your deployed frontend origin later, e.g.
+        # "https://cave.mda.sa"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],  # helpful for FileResponse filename
+)
+
 OUT_DIR = Path("/tmp/tts")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
