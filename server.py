@@ -13,14 +13,21 @@ app = FastAPI()
 OUT_DIR = Path("/tmp/tts")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-DEVICE = "cpu"  # Render is CPU-only :contentReference[oaicite:3]{index=3}
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+ 
 MODEL = None
 
 @app.on_event("startup")
 def load_model():
     global MODEL
-    # loads multilingual model that supports Arabic :contentReference[oaicite:4]{index=4}
+  
     MODEL = ChatterboxMultilingualTTS.from_pretrained(device=DEVICE)
+    # Optional: speed/VRAM improvements when using GPU
+    if DEVICE == "cuda":
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
 
 @app.get("/health")
 def health():
