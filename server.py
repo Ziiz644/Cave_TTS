@@ -1,4 +1,3 @@
-server.py
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
 import os, uuid
