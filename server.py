@@ -2,6 +2,7 @@ import os
 import uuid
 import re
 import tempfile
+import logging
 from pathlib import Path
 from typing import Optional, Generator
 
@@ -19,18 +20,28 @@ from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
 APP_NAME = "chatterbox-tts"
 
+# ---------------- Logging ----------------
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+log = logging.getLogger(APP_NAME)
+
 # ---------------- Config (ENV) ----------------
 USE_GPU = os.getenv("USE_GPU", "true").lower() in ("1", "true", "yes", "y")
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "ar").strip().lower()  # "ar" or "en"
 ALLOW_SPEAKER_URL = os.getenv("ALLOW_SPEAKER_URL", "true").lower() in ("1", "true", "yes", "y")
 
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "2000"))
-OUTPUT_SAMPLE_RATE = int(os.getenv("OUTPUT_SAMPLE_RATE", "24000"))  # for streaming PCM output
+OUTPUT_SAMPLE_RATE = int(os.getenv("OUTPUT_SAMPLE_RATE", "24000"))  # streaming PCM output
 MAX_SPEAKER_WAV_BYTES = int(os.getenv("MAX_SPEAKER_WAV_BYTES", str(8 * 1024 * 1024)))
 SPEAKER_HTTP_TIMEOUT = float(os.getenv("SPEAKER_HTTP_TIMEOUT", "20"))
 
 MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "220"))
 MAX_CONCURRENT_SYNTH = int(os.getenv("MAX_CONCURRENT_SYNTH", "1"))
+
+# Streaming frame size: smaller frames = more real-time flush through proxies
+PCM_FRAME_BYTES = int(os.getenv("PCM_FRAME_BYTES", str(32 * 1024)))  # 32KB
+
+# Early keepalive: 120ms of silence at 24kHz mono s16le => 0.12 * 24000 * 2 = 5760 bytes
+EARLY_SILENCE_MS = int(os.getenv("EARLY_SILENCE_MS", "120"))
 
 CORS_ORIGINS = os.getenv(
     "CORS_ORIGINS",
@@ -42,7 +53,7 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ------------------------------------------------
 
-app = FastAPI(title=APP_NAME, version="1.0.0")
+app = FastAPI(title=APP_NAME, version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -111,6 +122,12 @@ def _float_to_s16le_pcm(audio: np.ndarray) -> bytes:
     return pcm16.tobytes(order="C")
 
 
+def _silence_pcm(ms: int, sample_rate: int) -> bytes:
+    frames = int((ms / 1000.0) * sample_rate)
+    # mono s16le => 2 bytes per frame
+    return (np.zeros(frames, dtype=np.int16)).tobytes(order="C")
+
+
 async def _download_to_temp(url: str) -> str:
     if not ALLOW_SPEAKER_URL:
         raise HTTPException(status_code=400, detail="speaker_wav_url is disabled")
@@ -142,7 +159,7 @@ async def _download_to_temp(url: str) -> str:
         if total == 0:
             raise HTTPException(status_code=400, detail="Downloaded speaker wav is empty")
 
-        # Quick RIFF/WAVE signature check (avoid HTML/403 surprises)
+        # RIFF/WAVE signature check
         with open(tmp_path, "rb") as f:
             head = f.read(12)
         if len(head) < 12 or head[0:4] != b"RIFF" or head[8:12] != b"WAVE":
@@ -173,6 +190,7 @@ def load_model():
             torch.set_float32_matmul_precision("high")
         except Exception:
             pass
+    log.info("Model loaded. device=%s sr=%s", DEVICE, getattr(MODEL, "sr", None))
 
 
 @app.get("/health")
@@ -187,6 +205,8 @@ def health():
         "max_text_chars": MAX_TEXT_CHARS,
         "max_concurrent_synth": MAX_CONCURRENT_SYNTH,
         "max_chunk_chars": MAX_CHUNK_CHARS,
+        "pcm_frame_bytes": PCM_FRAME_BYTES,
+        "early_silence_ms": EARLY_SILENCE_MS,
     }
 
 
@@ -247,8 +267,7 @@ async def speak_form(
 
 
 # ==========================================================
-# 2) STREAMING endpoint (PCM s16le) — for chat
-#    Accepts speaker_wav_url (like XTTS) or speaker_wav_path
+# 2) STREAMING endpoint (PCM s16le) — chat
 # ==========================================================
 class StreamRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=MAX_TEXT_CHARS)
@@ -256,14 +275,12 @@ class StreamRequest(BaseModel):
 
     speaker_wav_url: Optional[str] = None
     speaker_wav_path: Optional[str] = None
-
-    # backward compat field name if you want:
-    speaker_wav: Optional[str] = None
+    speaker_wav: Optional[str] = None  # backward compat
 
     exaggeration: float = Field(default=0.5)
     cfg_weight: float = Field(default=0.5)
 
-    format: str = Field(default="pcm")  # only pcm supported here
+    format: str = Field(default="pcm")
     sample_rate: int = Field(default=OUTPUT_SAMPLE_RATE)
 
     @field_validator("language")
@@ -309,7 +326,6 @@ async def stream_pcm(request: Request, payload: StreamRequest = Body(...)):
 
     tmp_ref = None
     try:
-        # Resolve ref audio
         audio_prompt_path = None
         if payload.speaker_wav_url:
             tmp_ref = await _download_to_temp(payload.speaker_wav_url.strip())
@@ -321,24 +337,54 @@ async def stream_pcm(request: Request, payload: StreamRequest = Body(...)):
             audio_prompt_path = p
 
         chunks = chunk_text(text, MAX_CHUNK_CHARS)
+        if not chunks:
+            raise HTTPException(status_code=400, detail="text is empty after normalization")
 
         def gen() -> Generator[bytes, None, None]:
+            """
+            Key streaming guarantees:
+            - yield a small PCM "silence" immediately to keep proxies happy
+            - yield PCM in small frames to force flushing (real streaming)
+            """
             _acquire_sem_or_503()
             try:
-                for ch in chunks:
-                    wav = MODEL.generate(
-                        ch,
-                        language_id=language_id,
-                        audio_prompt_path=audio_prompt_path,
-                        exaggeration=exaggeration,
-                        cfg_weight=cfg_weight,
-                    )
-                    # resample to OUTPUT_SAMPLE_RATE if needed
-                    # MODEL.sr might be different; enforce OUTPUT_SAMPLE_RATE for your frontend
-                    if int(MODEL.sr) != int(OUTPUT_SAMPLE_RATE):
-                        wav = ta.functional.resample(wav, orig_freq=MODEL.sr, new_freq=OUTPUT_SAMPLE_RATE)
+                # ✅ EARLY BYTES (proxy keepalive)
+                yield _silence_pcm(EARLY_SILENCE_MS, OUTPUT_SAMPLE_RATE)
 
-                    yield _float_to_s16le_pcm(wav.cpu().numpy() if hasattr(wav, "cpu") else np.asarray(wav))
+                for i, ch in enumerate(chunks):
+                    try:
+                        wav = MODEL.generate(
+                            ch,
+                            language_id=language_id,
+                            audio_prompt_path=audio_prompt_path,
+                            exaggeration=exaggeration,
+                            cfg_weight=cfg_weight,
+                        )
+
+                        # enforce OUTPUT_SAMPLE_RATE
+                        if int(MODEL.sr) != int(OUTPUT_SAMPLE_RATE):
+                            wav = ta.functional.resample(wav, orig_freq=MODEL.sr, new_freq=OUTPUT_SAMPLE_RATE)
+
+                        pcm = _float_to_s16le_pcm(
+                            wav.cpu().numpy() if hasattr(wav, "cpu") else np.asarray(wav)
+                        )
+
+                        # ✅ STREAM IN FRAMES (real flush)
+                        for off in range(0, len(pcm), PCM_FRAME_BYTES):
+                            yield pcm[off:off + PCM_FRAME_BYTES]
+
+                        # small separator silence between chunks helps audio feel natural
+                        # and also prevents long compute gaps appearing as "dead air"
+                        yield _silence_pcm(40, OUTPUT_SAMPLE_RATE)
+
+                    except GeneratorExit:
+                        # client disconnected
+                        return
+                    except Exception as e:
+                        log.exception("stream gen failed req_id=%s chunk=%s/%s err=%s", req_id, i + 1, len(chunks), e)
+                        # stop streaming; client will see incomplete if already started, but we avoid hard crash loops
+                        return
+
             finally:
                 _release_sem()
 
@@ -346,8 +392,15 @@ async def stream_pcm(request: Request, payload: StreamRequest = Body(...)):
             "X-Request-Id": req_id,
             "X-Audio-Format": "pcm",
             "X-Sample-Rate": str(OUTPUT_SAMPLE_RATE),
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
         }
-        return StreamingResponse(gen(), media_type="application/octet-stream", headers=headers)
+
+        return StreamingResponse(
+            gen(),
+            media_type="application/octet-stream",
+            headers=headers,
+        )
 
     finally:
         if tmp_ref and os.path.exists(tmp_ref):
